@@ -1,8 +1,8 @@
 diff --git a/video/out/opengl/context_android.c b/video/out/opengl/context_android.c
-index bc1717c1be..3fba046946 100644
+index bc1717c1be..74119df49e 100644
 --- a/video/out/opengl/context_android.c
 +++ b/video/out/opengl/context_android.c
-@@ -18,21 +18,322 @@
+@@ -18,21 +18,330 @@
  #include <EGL/egl.h>
  #include <EGL/eglext.h>
  
@@ -289,8 +289,16 @@ index bc1717c1be..3fba046946 100644
 +        // swaps en el mismo slot (sin esto, ~1/3 de los swaps se colaban y
 +        // mpv medía 82-98Hz en un panel de 60).
 +        target = v->last_target_ns + p;
-+        if (target < now)
-+            target += ((now - target) / p + 1) * p;  // saltar slots, fase fija
++        if (now > target + p / 2) {
++            // Frame TARDE para su slot (spike de GPU/decode): pasa ya, SIN
++            // correr la grilla — el próximo frame vuelve a aterrizar en su
++            // slot original. Si en cambio empujáramos la grilla, un spike
++            // aislado corría todos los slots siguientes hasta que mpv
++            // dropeaba un frame para resincronizar (cascada medida:
++            // voDrops ~2.6/s, estimated-display-fps hundido a 59.1).
++            v->last_target_ns = target + ((now - target) / p) * p;
++            return;
++        }
 +        if (now - last < 3 * tick_p) {
 +            // Re-snap al tick real más cercano (deriva de reloj). Con p
 +            // múltiplo del tick, la paridad de sub-fase se mantiene.
@@ -325,7 +333,7 @@ index bc1717c1be..3fba046946 100644
      eglSwapBuffers(p->egl_display, p->egl_surface);
  }
  
-@@ -41,6 +342,8 @@ static void android_uninit(struct ra_ctx *ctx)
+@@ -41,6 +350,8 @@ static void android_uninit(struct ra_ctx *ctx)
      struct priv *p = ctx->priv;
      ra_gl_ctx_uninit(ctx);
  
@@ -334,7 +342,7 @@ index bc1717c1be..3fba046946 100644
      if (p->egl_surface) {
          eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         EGL_NO_CONTEXT);
-@@ -97,6 +400,8 @@ static bool android_init(struct ra_ctx *ctx)
+@@ -97,6 +408,8 @@ static bool android_init(struct ra_ctx *ctx)
      if (!ra_gl_ctx_init(ctx, &p->gl, params))
          goto fail;
  
@@ -343,7 +351,7 @@ index bc1717c1be..3fba046946 100644
      return true;
  fail:
      android_uninit(ctx);
-@@ -117,6 +422,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
+@@ -117,6 +430,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
  
  static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
  {
