@@ -1,8 +1,8 @@
 diff --git a/video/out/opengl/context_android.c b/video/out/opengl/context_android.c
-index bc1717c1be..0d197b180d 100644
+index bc1717c1be..ff48db7d8d 100644
 --- a/video/out/opengl/context_android.c
 +++ b/video/out/opengl/context_android.c
-@@ -18,21 +18,254 @@
+@@ -18,21 +18,276 @@
  #include <EGL/egl.h>
  #include <EGL/eglext.h>
  
@@ -62,6 +62,10 @@ index bc1717c1be..0d197b180d 100644
 +    // Sólo hilo de vsync: anuncio de tasa al core.
 +    int64_t announced_period_ns;
 +    int ticks;
++
++    // Sólo hilo del vo (swap_buffers): último slot usado, para espaciado
++    // monotónico entre swaps consecutivos.
++    int64_t last_target_ns;
 +
 +    int64_t offset_ns;
 +    bool enabled;
@@ -229,12 +233,30 @@ index bc1717c1be..0d197b180d 100644
 +    int64_t now = dy_now_ns();
 +    // Choreographer dejó de tickear (app invisible/PiP): passthrough para no
 +    // bloquear el vo indefinidamente.
-+    if (now - last > MPMAX(20 * p, INT64_C(500000000)))
++    if (now - last > MPMAX(20 * p, INT64_C(500000000))) {
++        v->last_target_ns = 0;
 +        return;
-+    int64_t k = (now - last - v->offset_ns) / p + 1;
-+    if (k < 1)
-+        k = 1;
-+    int64_t target = last + k * p + v->offset_ns;
++    }
++    int64_t target;
++    if (now - last > 3 * p && v->last_target_ns > 0) {
++        // Ticks atrasados (hilo de vsync estrangulado): grilla autoportante
++        // con el último período conocido, para no perder el espaciado.
++        target = v->last_target_ns + p;
++        if (target < now - p)
++            target = now;
++    } else {
++        int64_t k = (now - last - v->offset_ns) / p + 1;
++        if (k < 1)
++            k = 1;
++        target = last + k * p + v->offset_ns;
++    }
++    // Espaciado monotónico: nunca dos swaps en el mismo slot, aunque el
++    // cálculo por-tick caiga corto (tick atrasado, swaps pegados). Sin esto
++    // ~1/3 de los swaps se colaban sin espera y mpv medía 82-98Hz en un
++    // display de 60.
++    if (v->last_target_ns > 0 && target < v->last_target_ns + p * 3 / 4)
++        target = v->last_target_ns + p;
++    v->last_target_ns = target;
 +    int64_t wait = target - now;
 +    if (wait > 0 && wait < INT64_C(100000000))
 +        mp_sleep_ns(wait);
@@ -257,7 +279,7 @@ index bc1717c1be..0d197b180d 100644
      eglSwapBuffers(p->egl_display, p->egl_surface);
  }
  
-@@ -41,6 +274,8 @@ static void android_uninit(struct ra_ctx *ctx)
+@@ -41,6 +296,8 @@ static void android_uninit(struct ra_ctx *ctx)
      struct priv *p = ctx->priv;
      ra_gl_ctx_uninit(ctx);
  
@@ -266,7 +288,7 @@ index bc1717c1be..0d197b180d 100644
      if (p->egl_surface) {
          eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         EGL_NO_CONTEXT);
-@@ -97,6 +332,8 @@ static bool android_init(struct ra_ctx *ctx)
+@@ -97,6 +354,8 @@ static bool android_init(struct ra_ctx *ctx)
      if (!ra_gl_ctx_init(ctx, &p->gl, params))
          goto fail;
  
@@ -275,7 +297,7 @@ index bc1717c1be..0d197b180d 100644
      return true;
  fail:
      android_uninit(ctx);
-@@ -117,6 +354,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
+@@ -117,6 +376,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
  
  static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
  {
