@@ -1,0 +1,27 @@
+diff --git a/libavcodec/mediacodecdec.c b/libavcodec/mediacodecdec.c
+index 2146490..caa2e41 100644
+--- a/libavcodec/mediacodecdec.c
++++ b/libavcodec/mediacodecdec.c
+@@ -395,6 +395,22 @@ static av_cold int mediacodec_decode_init(AVCodecContext *avctx)
+     ff_AMediaFormat_setInt32(format, "width", avctx->width);
+     ff_AMediaFormat_setInt32(format, "height", avctx->height);
+ 
++    /* DY-PATCH: pistas de rendimiento del codec, como hace ExoPlayer
++     * (KEY_OPERATING_RATE / KEY_PRIORITY / KEY_FRAME_RATE). Sin
++     * operating-rate el firmware clockea el decoder en modo best-effort y
++     * el contenido pesado (p.ej. 8K AV1) queda clavado muy por debajo del
++     * framerate real sin recuperarse nunca. priority=0 = tiempo real. */
++    {
++        int fps = 0;
++        if (avctx->framerate.den > 0 && avctx->framerate.num > 0)
++            fps = avctx->framerate.num / avctx->framerate.den;
++        if (fps <= 0 || fps > 240)
++            fps = 60;
++        ff_AMediaFormat_setInt32(format, "priority", 0);
++        ff_AMediaFormat_setInt32(format, "operating-rate", fps * 2);
++        ff_AMediaFormat_setInt32(format, "frame-rate", fps);
++    }
++
+     s->ctx = av_mallocz(sizeof(*s->ctx));
+     if (!s->ctx) {
+         av_log(avctx, AV_LOG_ERROR, "Failed to allocate MediaCodecDecContext\n");
