@@ -1,0 +1,270 @@
+diff --git a/video/out/opengl/context_android.c b/video/out/opengl/context_android.c
+index bc1717c1be..97749669ae 100644
+--- a/video/out/opengl/context_android.c
++++ b/video/out/opengl/context_android.c
+@@ -18,21 +18,230 @@
+ #include <EGL/egl.h>
+ #include <EGL/eglext.h>
+ 
++#include <dlfcn.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdlib.h>
++#include <time.h>
++
++#include <android/looper.h>
++
++#include "common/msg.h"
++#include "osdep/timer.h"
+ #include "video/out/android_common.h"
+ #include "egl_helpers.h"
+ #include "common/common.h"
+ #include "context.h"
+ 
++// DY-PATCH: pacing de swaps anclado al vsync real vía Choreographer.
++//
++// En embebido (--wid con una Surface consumida por un ImageReader, p.ej.
++// Flutter/media-kit) eglSwapBuffers no bloquea nunca: mpv queda ciego al
++// vsync, sus estimaciones de display-fps divergen (runaway medido: de 60Hz
++// reales a 215→280Hz con video-sync=display-resample) y la entrega de
++// frames "monta" el borde de muestreo del consumidor → judder.
++//
++// Este pacing duerme cada swap hasta el próximo vsync real (+offset), con lo
++// que: los swaps quedan cuantizados a la cadencia del display (como en
++// desktop), estimated-display-fps mide la realidad, y VOCTRL_GET_DISPLAY_FPS
++// reporta la tasa medida (display-sync confiable). Análogo al
++// VideoFrameReleaseHelper de ExoPlayer.
++//
++// Escapes: DY_MPV_NO_VSYNC_PACING=1 lo desactiva por completo;
++// DY_MPV_VSYNC_OFFSET_MS ajusta el offset post-vsync (default 2 ms, para no
++// competir con el raster del consumidor que adquiere en el tick).
++
++typedef struct AChoreographer AChoreographer;
++typedef void (*dy_frame_cb)(long frame_time_ns, void *data);
++typedef void (*dy_frame_cb64)(int64_t frame_time_ns, void *data);
++
++struct dy_vsync {
++    struct mp_log *log;
++    AChoreographer *(*get_instance)(void);
++    void (*post_cb)(AChoreographer *, dy_frame_cb, void *);
++    void (*post_cb64)(AChoreographer *, dy_frame_cb64, void *);
++    AChoreographer *choreographer;  // sólo hilo de vsync
++
++    pthread_t thread;
++    bool thread_started;
++    ALooper *looper;
++    atomic_bool stop;
++
++    _Atomic int64_t last_vsync_ns;  // CLOCK_MONOTONIC crudo
++    _Atomic int64_t period_ns;      // EMA del período de vsync
++
++    int64_t offset_ns;
++    bool enabled;
++};
++
++static int64_t dy_now_ns(void)
++{
++    struct timespec ts;
++    clock_gettime(CLOCK_MONOTONIC, &ts);
++    return (int64_t)ts.tv_sec * INT64_C(1000000000) + ts.tv_nsec;
++}
++
++static void dy_vsync_arm(struct dy_vsync *v);
++
++static void dy_vsync_tick(struct dy_vsync *v, int64_t t)
++{
++    int64_t prev = atomic_load(&v->last_vsync_ns);
++    if (prev > 0 && t > prev) {
++        int64_t d = t - prev;
++        // Plausible: 10..500 Hz.
++        if (d > INT64_C(2000000) && d < INT64_C(100000000)) {
++            int64_t p = atomic_load(&v->period_ns);
++            if (p > 0) {
++                // Callbacks salteados (throttling puntual): normaliza a un
++                // período antes de promediar.
++                int64_t n = (d + p / 2) / p;
++                if (n > 1 && n <= 10)
++                    d /= n;
++                p = (p * 7 + d) / 8;
++            } else {
++                p = d;
++            }
++            atomic_store(&v->period_ns, p);
++        }
++    }
++    atomic_store(&v->last_vsync_ns, t);
++    if (!atomic_load(&v->stop))
++        dy_vsync_arm(v);
++}
++
++static void dy_vsync_cb64(int64_t frame_time_ns, void *data)
++{
++    dy_vsync_tick(data, frame_time_ns);
++}
++
++static void dy_vsync_cb32(long frame_time_ns, void *data)
++{
++    // El callback legacy trunca el timestamp en 32 bits: usamos el reloj al
++    // momento del dispatch (ruido de scheduling ~0.1ms, el EMA lo suaviza).
++    (void)frame_time_ns;
++    dy_vsync_tick(data, dy_now_ns());
++}
++
++static void dy_vsync_arm(struct dy_vsync *v)
++{
++    if (v->post_cb64) {
++        v->post_cb64(v->choreographer, dy_vsync_cb64, v);
++    } else {
++        v->post_cb(v->choreographer, dy_vsync_cb32, v);
++    }
++}
++
++static void *dy_vsync_thread(void *data)
++{
++    struct dy_vsync *v = data;
++    v->looper = ALooper_prepare(0);
++    v->choreographer = v->get_instance();
++    if (!v->looper || !v->choreographer)
++        return NULL;
++    dy_vsync_arm(v);
++    while (!atomic_load(&v->stop))
++        ALooper_pollOnce(250, NULL, NULL, NULL);
++    return NULL;
++}
++
++static void dy_vsync_init(struct dy_vsync *v, struct mp_log *log)
++{
++    v->log = log;
++    const char *no = getenv("DY_MPV_NO_VSYNC_PACING");
++    if (no && no[0] == '1') {
++        mp_verbose(log, "vsync pacing deshabilitado (DY_MPV_NO_VSYNC_PACING)\n");
++        return;
++    }
++    v->offset_ns = INT64_C(2000000);
++    const char *off = getenv("DY_MPV_VSYNC_OFFSET_MS");
++    if (off && off[0])
++        v->offset_ns = (int64_t)(atof(off) * 1e6);
++
++    void *lib = dlopen("libandroid.so", RTLD_NOW);
++    if (lib) {
++        v->get_instance = (AChoreographer *(*)(void))
++            dlsym(lib, "AChoreographer_getInstance");
++        v->post_cb = (void (*)(AChoreographer *, dy_frame_cb, void *))
++            dlsym(lib, "AChoreographer_postFrameCallback");
++        v->post_cb64 = (void (*)(AChoreographer *, dy_frame_cb64, void *))
++            dlsym(lib, "AChoreographer_postFrameCallback64");
++    }
++    if (!v->get_instance || (!v->post_cb && !v->post_cb64)) {
++        mp_verbose(log, "AChoreographer no disponible: swaps sin pacing\n");
++        return;
++    }
++    if (pthread_create(&v->thread, NULL, dy_vsync_thread, v) != 0) {
++        mp_verbose(log, "no se pudo crear el hilo de vsync\n");
++        return;
++    }
++    v->thread_started = true;
++    v->enabled = true;
++    mp_verbose(log, "vsync pacing via Choreographer activo (offset %.1f ms)\n",
++               v->offset_ns / 1e6);
++}
++
++static void dy_vsync_uninit(struct dy_vsync *v)
++{
++    if (!v->thread_started)
++        return;
++    atomic_store(&v->stop, true);
++    if (v->looper)
++        ALooper_wake(v->looper);
++    pthread_join(v->thread, NULL);
++    v->thread_started = false;
++    v->enabled = false;
++}
++
++static double dy_vsync_fps(struct dy_vsync *v)
++{
++    if (!v->enabled)
++        return 0;
++    int64_t p = atomic_load(&v->period_ns);
++    int64_t last = atomic_load(&v->last_vsync_ns);
++    if (p <= 0 || last <= 0)
++        return 0;
++    // Pantalla dormida / app oculta: no reportar una tasa vieja.
++    if (dy_now_ns() - last > INT64_C(500000000))
++        return 0;
++    return 1e9 / (double)p;
++}
++
++static void dy_vsync_wait(struct dy_vsync *v)
++{
++    if (!v->enabled)
++        return;
++    int64_t p = atomic_load(&v->period_ns);
++    int64_t last = atomic_load(&v->last_vsync_ns);
++    if (p <= 0 || last <= 0)
++        return;
++    int64_t now = dy_now_ns();
++    // Choreographer dejó de tickear (app invisible/PiP): passthrough para no
++    // bloquear el vo indefinidamente.
++    if (now - last > MPMAX(20 * p, INT64_C(500000000)))
++        return;
++    int64_t k = (now - last - v->offset_ns) / p + 1;
++    if (k < 1)
++        k = 1;
++    int64_t target = last + k * p + v->offset_ns;
++    int64_t wait = target - now;
++    if (wait > 0 && wait < INT64_C(100000000))
++        mp_sleep_ns(wait);
++}
++
++// ---- fin DY-PATCH -------------------------------------------------------
++
+ struct priv {
+     struct GL gl;
+     EGLDisplay egl_display;
+     EGLContext egl_context;
+     EGLSurface egl_surface;
++    struct dy_vsync vsync;
+ };
+ 
+ static void android_swap_buffers(struct ra_ctx *ctx)
+ {
+     struct priv *p = ctx->priv;
++    dy_vsync_wait(&p->vsync);
+     eglSwapBuffers(p->egl_display, p->egl_surface);
+ }
+ 
+@@ -41,6 +250,8 @@ static void android_uninit(struct ra_ctx *ctx)
+     struct priv *p = ctx->priv;
+     ra_gl_ctx_uninit(ctx);
+ 
++    dy_vsync_uninit(&p->vsync);
++
+     if (p->egl_surface) {
+         eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
+                        EGL_NO_CONTEXT);
+@@ -97,6 +308,8 @@ static bool android_init(struct ra_ctx *ctx)
+     if (!ra_gl_ctx_init(ctx, &p->gl, params))
+         goto fail;
+ 
++    dy_vsync_init(&p->vsync, ctx->log);
++
+     return true;
+ fail:
+     android_uninit(ctx);
+@@ -117,6 +330,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
+ 
+ static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
+ {
++    struct priv *p = ctx->priv;
++    switch (request) {
++    case VOCTRL_GET_DISPLAY_FPS: {
++        double fps = dy_vsync_fps(&p->vsync);
++        if (fps <= 0)
++            break;
++        *(double *)arg = fps;
++        return VO_TRUE;
++    }
++    }
+     return VO_NOTIMPL;
+ }
+ 
