@@ -1,8 +1,8 @@
 diff --git a/video/out/opengl/context_android.c b/video/out/opengl/context_android.c
-index bc1717c1be..74119df49e 100644
+index bc1717c1be..23d2ed0b9c 100644
 --- a/video/out/opengl/context_android.c
 +++ b/video/out/opengl/context_android.c
-@@ -18,21 +18,330 @@
+@@ -18,21 +18,355 @@
  #include <EGL/egl.h>
  #include <EGL/eglext.h>
  
@@ -10,7 +10,9 @@ index bc1717c1be..74119df49e 100644
 +#include <pthread.h>
 +#include <stdatomic.h>
 +#include <stdlib.h>
++#include <sys/resource.h>
 +#include <time.h>
++#include <unistd.h>
 +
 +#include <android/looper.h>
 +
@@ -127,11 +129,25 @@ index bc1717c1be..74119df49e 100644
 +            int64_t p = atomic_load(&v->period_ns);
 +            if (p > 0) {
 +                // Callbacks salteados (throttling puntual): normaliza a un
-+                // período antes de promediar.
++                // período antes de promediar, sólo si el resultado calza con
++                // el período conocido.
 +                int64_t n = (d + p / 2) / p;
-+                if (n > 1 && n <= 10)
-+                    d /= n;
-+                p = (p * 7 + d) / 8;
++                if (n > 1 && n <= 10) {
++                    int64_t dn = d / n;
++                    int64_t dd = dn > p ? dn - p : p - dn;
++                    if (dd * 8 < p)
++                        d = dn;
++                }
++                int64_t step = d > p ? d - p : p - d;
++                if (step * 4 > p) {
++                    // Cambio de modo del panel (boost táctil 60↔120):
++                    // re-lock inmediato. Blendear dejaba ~10 ticks con un
++                    // período intermedio y los slots caían mal (un drop por
++                    // cada inicio/fin de boost).
++                    p = d;
++                } else {
++                    p = (p * 7 + d) / 8;
++                }
 +            } else {
 +                p = d;
 +            }
@@ -184,9 +200,18 @@ index bc1717c1be..74119df49e 100644
 +    }
 +}
 +
++// Prioridad de display (equivalente a THREAD_PRIORITY_URGENT_DISPLAY):
++// permitido para hilos propios en Android; un spike de CPU no debe atrasar
++// ni la referencia de fase ni el swap contra su deadline.
++static void dy_boost_thread_priority(void)
++{
++    setpriority(PRIO_PROCESS, gettid(), -10);
++}
++
 +static void *dy_vsync_thread(void *data)
 +{
 +    struct dy_vsync *v = data;
++    dy_boost_thread_priority();
 +    v->looper = ALooper_prepare(0);
 +    v->choreographer = v->get_instance();
 +    if (!v->looper || !v->choreographer)
@@ -333,7 +358,7 @@ index bc1717c1be..74119df49e 100644
      eglSwapBuffers(p->egl_display, p->egl_surface);
  }
  
-@@ -41,6 +350,8 @@ static void android_uninit(struct ra_ctx *ctx)
+@@ -41,6 +375,8 @@ static void android_uninit(struct ra_ctx *ctx)
      struct priv *p = ctx->priv;
      ra_gl_ctx_uninit(ctx);
  
@@ -342,16 +367,19 @@ index bc1717c1be..74119df49e 100644
      if (p->egl_surface) {
          eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         EGL_NO_CONTEXT);
-@@ -97,6 +408,8 @@ static bool android_init(struct ra_ctx *ctx)
+@@ -97,6 +433,11 @@ static bool android_init(struct ra_ctx *ctx)
      if (!ra_gl_ctx_init(ctx, &p->gl, params))
          goto fail;
  
++    // android_init corre en el hilo del vo: elevarlo también (el render +
++    // swap compiten contra el deadline del slot).
++    dy_boost_thread_priority();
 +    dy_vsync_init(&p->vsync, ctx->log, ctx->vo);
 +
      return true;
  fail:
      android_uninit(ctx);
-@@ -117,6 +430,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
+@@ -117,6 +458,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
  
  static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
  {
