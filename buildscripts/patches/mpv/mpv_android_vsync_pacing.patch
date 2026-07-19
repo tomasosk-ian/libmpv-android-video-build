@@ -1,8 +1,8 @@
 diff --git a/video/out/opengl/context_android.c b/video/out/opengl/context_android.c
-index bc1717c1be..97749669ae 100644
+index bc1717c1be..0d197b180d 100644
 --- a/video/out/opengl/context_android.c
 +++ b/video/out/opengl/context_android.c
-@@ -18,21 +18,230 @@
+@@ -18,21 +18,254 @@
  #include <EGL/egl.h>
  #include <EGL/eglext.h>
  
@@ -45,6 +45,7 @@ index bc1717c1be..97749669ae 100644
 +
 +struct dy_vsync {
 +    struct mp_log *log;
++    struct vo *vo;
 +    AChoreographer *(*get_instance)(void);
 +    void (*post_cb)(AChoreographer *, dy_frame_cb, void *);
 +    void (*post_cb64)(AChoreographer *, dy_frame_cb64, void *);
@@ -57,6 +58,10 @@ index bc1717c1be..97749669ae 100644
 +
 +    _Atomic int64_t last_vsync_ns;  // CLOCK_MONOTONIC crudo
 +    _Atomic int64_t period_ns;      // EMA del período de vsync
++
++    // Sólo hilo de vsync: anuncio de tasa al core.
++    int64_t announced_period_ns;
++    int ticks;
 +
 +    int64_t offset_ns;
 +    bool enabled;
@@ -93,6 +98,23 @@ index bc1717c1be..97749669ae 100644
 +        }
 +    }
 +    atomic_store(&v->last_vsync_ns, t);
++
++    // mpv sólo consulta VOCTRL_GET_DISPLAY_FPS al inicializar el vo y al
++    // recibir VO_EVENT_WIN_STATE. Sin este aviso, la tasa medida nunca llega
++    // al core (la consulta inicial ocurre antes del primer tick) y
++    // display-sync no puede engancharse. Avisamos cuando hay una medición
++    // estable nueva o cambia >5% (p.ej. modo 120Hz → 60Hz).
++    v->ticks++;
++    int64_t p = atomic_load(&v->period_ns);
++    if (p > 0 && v->ticks >= 3) {
++        int64_t diff = p > v->announced_period_ns ? p - v->announced_period_ns
++                                                  : v->announced_period_ns - p;
++        if (v->announced_period_ns <= 0 || diff * 20 > v->announced_period_ns) {
++            v->announced_period_ns = p;
++            vo_event(v->vo, VO_EVENT_WIN_STATE);
++        }
++    }
++
 +    if (!atomic_load(&v->stop))
 +        dy_vsync_arm(v);
 +}
@@ -132,9 +154,11 @@ index bc1717c1be..97749669ae 100644
 +    return NULL;
 +}
 +
-+static void dy_vsync_init(struct dy_vsync *v, struct mp_log *log)
++static void dy_vsync_init(struct dy_vsync *v, struct mp_log *log,
++                          struct vo *vo)
 +{
 +    v->log = log;
++    v->vo = vo;
 +    const char *no = getenv("DY_MPV_NO_VSYNC_PACING");
 +    if (no && no[0] == '1') {
 +        mp_verbose(log, "vsync pacing deshabilitado (DY_MPV_NO_VSYNC_PACING)\n");
@@ -233,7 +257,7 @@ index bc1717c1be..97749669ae 100644
      eglSwapBuffers(p->egl_display, p->egl_surface);
  }
  
-@@ -41,6 +250,8 @@ static void android_uninit(struct ra_ctx *ctx)
+@@ -41,6 +274,8 @@ static void android_uninit(struct ra_ctx *ctx)
      struct priv *p = ctx->priv;
      ra_gl_ctx_uninit(ctx);
  
@@ -242,16 +266,16 @@ index bc1717c1be..97749669ae 100644
      if (p->egl_surface) {
          eglMakeCurrent(p->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE,
                         EGL_NO_CONTEXT);
-@@ -97,6 +308,8 @@ static bool android_init(struct ra_ctx *ctx)
+@@ -97,6 +332,8 @@ static bool android_init(struct ra_ctx *ctx)
      if (!ra_gl_ctx_init(ctx, &p->gl, params))
          goto fail;
  
-+    dy_vsync_init(&p->vsync, ctx->log);
++    dy_vsync_init(&p->vsync, ctx->log, ctx->vo);
 +
      return true;
  fail:
      android_uninit(ctx);
-@@ -117,6 +330,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
+@@ -117,6 +354,16 @@ static bool android_reconfig(struct ra_ctx *ctx)
  
  static int android_control(struct ra_ctx *ctx, int *events, int request, void *arg)
  {
